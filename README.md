@@ -40,9 +40,10 @@ npm install                            # serverless-python-requirements plugin
 npm run --prefix frontend install      # frontend deps
 ```
 
-Update `serverless.yml`'s `custom.bucket`, `provider.profile`, and `provider.region` to your own AWS account before deploying.
+Update `serverless.yml`'s `custom.bucket` and `provider.region` to your own AWS account before deploying.
 
 ```bash
+# locally: export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, or add --aws-profile <name>
 serverless deploy
 ```
 
