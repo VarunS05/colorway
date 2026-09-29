@@ -1,4 +1,4 @@
-service: final-python-thumbnail
+service: colorway
 
 frameworkVersion: '3'
 
@@ -14,13 +14,14 @@ provider:
     THUMBNAIL_SIZE: 128
     REGION_NAME: ${self:provider.region}
     DYNAMODB_TABLE: ${self:custom.dynamoTable}
-  
+    STATE_MACHINE_ARN: !Ref ColorwayStateMachine
+
   iam:
     role:
       statements:
         - Effect: 'Allow'
           Resource: '*'
-          Action: 's3:*' 
+          Action: 's3:*'
         - Effect: 'Allow'
           Action:
             - dynamodb:Query
@@ -30,7 +31,13 @@ provider:
             - dynamodb:UpdateItem
             - dynamodb:DeleteItem
           Resource: "arn:aws:dynamodb:${opt:region, self:provider.region}:*:table/${self:provider.environment.DYNAMODB_TABLE}"
-        
+        - Effect: 'Allow'
+          Action: 'states:StartExecution'
+          Resource: !Ref ColorwayStateMachine
+        - Effect: 'Allow'
+          Action: 'rekognition:DetectLabels'
+          Resource: '*'
+
 
 custom:
   bucket: varun-thumbnails
@@ -39,28 +46,42 @@ custom:
     dockerizePip: true
 
 functions:
+  # Entry point: S3 upload -> thumbnail -> starts the Colorway state machine.
   s3_thumbnail_generator:
     handler: handler.s3_thumbnail_generator
     events:
-      - s3: 
+      - s3:
           bucket: ${self:custom.bucket}
           event: s3:ObjectCreated:*
           rules:
             - suffix: .png
+
+  # Step Functions workflow steps (not triggered directly; invoked as Tasks
+  # in the ColorwayStateMachine defined under resources below).
+  extractColor:
+    handler: color_extraction.handler
+
+  autoTag:
+    handler: auto_tag.handler
+    timeout: 15
+
+  storeMetadata:
+    handler: handler.store_metadata
+
   list:
       handler: handler.s3_get_thumbnail_urls
       events:
         - http:
            path: images/all
-           method: get 
+           method: get
            cors: true
 
-  get: 
+  get:
      handler: handler.s3_get_item
      events:
        - http:
            path: images/get/{id}
-           method: get 
+           method: get
            cors: true
 
   delete:
@@ -68,9 +89,8 @@ functions:
       events:
         - http:
             path: images/delete/{id}
-            method: delete 
+            method: delete
             cors: true
-
 
 
 resources:
@@ -88,8 +108,61 @@ resources:
           ReadCapacityUnits: 1
           WriteCapacityUnits: 1
         TableName: ${self:provider.environment.DYNAMODB_TABLE}
-  
 
+    # Executes ExtractColor -> AutoTag -> StoreMetadata in sequence, once per
+    # uploaded image. Each Task invokes a Lambda directly by ARN, so the
+    # Lambda's return value becomes the next Task's input unmodified (the
+    # handlers are written to pass their event through with **event).
+    ColorwayStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: colorway-pipeline-${self:provider.stage}
+        RoleArn: !GetAtt ColorwayStateMachineRole.Arn
+        DefinitionString:
+          Fn::Sub: |
+            {
+              "Comment": "Colorway asset pipeline: extract color, auto-tag, store metadata",
+              "StartAt": "ExtractColor",
+              "States": {
+                "ExtractColor": {
+                  "Type": "Task",
+                  "Resource": "${ExtractColorLambdaFunction.Arn}",
+                  "Next": "AutoTag"
+                },
+                "AutoTag": {
+                  "Type": "Task",
+                  "Resource": "${AutoTagLambdaFunction.Arn}",
+                  "Next": "StoreMetadata"
+                },
+                "StoreMetadata": {
+                  "Type": "Task",
+                  "Resource": "${StoreMetadataLambdaFunction.Arn}",
+                  "End": true
+                }
+              }
+            }
+
+    ColorwayStateMachineRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: states.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: InvokeColorwayLambdas
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource:
+                    - !GetAtt ExtractColorLambdaFunction.Arn
+                    - !GetAtt AutoTagLambdaFunction.Arn
+                    - !GetAtt StoreMetadataLambdaFunction.Arn
 
 
 plugins:

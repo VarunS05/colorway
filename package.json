@@ -1,5 +1,18 @@
 {
   "devDependencies": {
     "serverless-python-requirements": "^6.1.2"
-  }
+  },
+  "name": "colorway",
+  "version": "1.0.0",
+  "description": "Serverless design-asset pipeline: S3 upload -> thumbnail -> Step Functions (dominant color extraction + Rekognition auto-tagging) -> DynamoDB, with a React gallery.",
+  "main": "handler.py",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "pytest tests/ -v"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
 }

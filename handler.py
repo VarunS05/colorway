@@ -7,44 +7,46 @@ import uuid
 import json
 
 # AWS clients
-s3 = boto3.client('s3')
+s3 = boto3.client('s3', region_name=str(os.environ['REGION_NAME']))
+stepfunctions = boto3.client('stepfunctions', region_name=str(os.environ['REGION_NAME']))
 dynamodb = boto3.resource(
     'dynamodb', region_name=str(os.environ['REGION_NAME']))
 
 # Environment variables
 size = int(os.environ['THUMBNAIL_SIZE'])
 dbtable = str(os.environ['DYNAMODB_TABLE'])
+state_machine_arn = os.environ.get('STATE_MACHINE_ARN')
 
-# Lambda handler triggered by S3 upload
+# Entry point, triggered by an S3 upload event. Generates a thumbnail, then
+# starts the Colorway Step Functions workflow (ExtractColor -> AutoTag ->
+# StoreMetadata) with the result -- S3 can't invoke Step Functions directly,
+# so this Lambda is the bridge between the upload event and the workflow.
 def s3_thumbnail_generator(event, context):
-    try:
-        print("EVENT:::", event)
-        bucket = event['Records'][0]['s3']['bucket']['name']
-        key = event['Records'][0]['s3']['object']['key']
-        img_size = event['Records'][0]['s3']['object']['size']
+    print("EVENT:::", event)
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = event['Records'][0]['s3']['object']['key']
+    img_size = event['Records'][0]['s3']['object']['size']
 
-        if not key.endswith("_thumbnail.png"):
-            image = get_s3_image(bucket, key)
-            thumbnail = image_to_thumbnail(image)
-            thumbnail_key = new_filename(key)
-            url = upload_to_s3(bucket, thumbnail_key, thumbnail, img_size)
+    if key.endswith("_thumbnail.png"):
+        return {'statusCode': 200, 'body': json.dumps({'message': 'Thumbnail already exists.'})}
 
-            return {
-                'statusCode': 200,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({'thumbnailUrl': url})
-            }
-        else:
-            return {
-                'statusCode': 200,
-                'body': json.dumps({'message': 'Thumbnail already exists.'})
-            }
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
-        }
+    image = get_s3_image(bucket, key)
+    thumbnail = image_to_thumbnail(image)
+    thumbnail_key = new_filename(key)
+    thumbnail_url = upload_to_s3(bucket, thumbnail_key, thumbnail)
+
+    workflow_input = {
+        'bucket': bucket,
+        'key': key,
+        'img_size': img_size,
+        'thumbnail_key': thumbnail_key,
+        'thumbnail_url': thumbnail_url,
+    }
+    stepfunctions.start_execution(
+        stateMachineArn=state_machine_arn,
+        input=json.dumps(workflow_input),
+    )
+    return {'statusCode': 200, 'body': json.dumps({'thumbnailUrl': thumbnail_url, 'workflowStarted': True})}
 
 # Download original image from S3
 def get_s3_image(bucket, key):
@@ -64,43 +66,49 @@ def new_filename(key):
     return key_split[0] + "_thumbnail.png"
 
 # Upload thumbnail to S3 (no ACL)
-def upload_to_s3(bucket, key, image, img_size):
+def upload_to_s3(bucket, key, image):
     out_thumbnail = BytesIO()
     image.save(out_thumbnail, 'PNG')
     out_thumbnail.seek(0)
 
-    response = s3.put_object(
+    s3.put_object(
         Body=out_thumbnail,
         Bucket=bucket,
         ContentType='image/png',
         Key=key
     )
-    print(response)
+    return '{}/{}/{}'.format(s3.meta.endpoint_url, bucket, key)
 
-    url = '{}/{}/{}'.format(s3.meta.endpoint_url, bucket, key)
-    s3_save_thumbnail_url_to_dynamo(url_path=url, img_size=img_size)
-    return url
 
-# Save metadata to DynamoDB
-def s3_save_thumbnail_url_to_dynamo(url_path, img_size):
-    toint = float(img_size * 0.53) / 1000
+# Final step of the Colorway workflow: writes the asset's thumbnail URL,
+# dominant colorway, and Rekognition tags to DynamoDB as one record.
+def store_metadata(event, context):
+    if event.get('skipped'):
+        return {'statusCode': 200, 'body': json.dumps({'message': event.get('reason', 'Skipped.')})}
+
+    toint = float(event.get('img_size', 0) * 0.53) / 1000
     table = dynamodb.Table(dbtable)
-    response = table.put_item(
-        Item={
-            'id': str(uuid.uuid4()),
-            'url': str(url_path),
-            'approxReducedSize': str(toint) + ' KB',
-            'createdAt': str(datetime.now()),
-            'updatedAt': str(datetime.now())
-        }
-    )
+    item = {
+        'id': str(uuid.uuid4()),
+        'url': event['thumbnail_url'],
+        'sourceKey': event['key'],
+        'colorway': event.get('colorway', {}),
+        'tags': event.get('tags', []),
+        'approxReducedSize': str(toint) + ' KB',
+        'createdAt': str(datetime.now()),
+        'updatedAt': str(datetime.now()),
+    }
+    table.put_item(Item=item)
     return {
         'statusCode': 200,
         'headers': {'Content-Type': 'application/json'},
-        'body': json.dumps({'message': 'Saved to DynamoDB'})
+        'body': json.dumps({'message': 'Saved to DynamoDB', 'id': item['id']})
     }
 
-# Fetch all thumbnail metadata from DynamoDB
+# Fetch all thumbnail metadata from DynamoDB, optionally filtered by
+# ?color=hex and/or ?tag=name query params. Filtering happens after the scan
+# (fine at demo/gallery scale; a production-sized table would want a GSI on
+# tags instead of a full scan).
 def s3_get_thumbnail_urls(event, context):
     table = dynamodb.Table(dbtable)
     response = table.scan()
@@ -109,9 +117,21 @@ def s3_get_thumbnail_urls(event, context):
         response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
         data.extend(response['Items'])
 
+    params = (event or {}).get('queryStringParameters') or {}
+    color_filter = params.get('color')
+    tag_filter = params.get('tag')
+
+    if color_filter:
+        data = [item for item in data if item.get('colorway', {}).get('hex') == color_filter]
+    if tag_filter:
+        data = [
+            item for item in data
+            if any(t['name'].lower() == tag_filter.lower() for t in item.get('tags', []))
+        ]
+
     return {
         'statusCode': 200,
-        'headers': {'Content-Type': 'application/json'},
+        'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
         'body': json.dumps(data)
     }
 
